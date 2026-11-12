@@ -26,8 +26,11 @@ class GymApiClient extends Model
         'access.read',
         'payments.read',
         'stats.read',
+        'actions.read',
         'members.write',
         'contracts.write',
+        'actions.write',
+        'mirror.write',
     ];
 
     public const READ_ABILITIES = [
@@ -37,6 +40,7 @@ class GymApiClient extends Model
         'access.read',
         'payments.read',
         'stats.read',
+        'actions.read',
     ];
 
     protected $fillable = [

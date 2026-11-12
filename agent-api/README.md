@@ -35,6 +35,44 @@ Dazu ein Protokoll: jede Anfrage landet in `agent_api_logs` (wer, was, welches M
 Statuscode, ob Daten geändert wurden). Bei einem ausgeführten Schreibvorgang stehen alter und
 neuer Wert dabei, sonst keine Inhalte.
 
+## Betrieb ohne den Portal-Anbieter: der Spiegel
+
+Wer gymportal als gehosteten Dienst nutzt, kann diese API nicht selbst dort einspielen. Dafür
+gibt es den Spiegel: eine eigene Installation dieses Codes, die ihre Daten aus dem Studio-Export
+bekommt, den das Portal ohnehin anbietet (Einstellungen, Datentransfer, Export als JSON).
+
+```bash
+# einmalig: Studio aus dem ersten Export anlegen, Token ausstellen
+php artisan agent:mirror import gym_export_studio_2026-11-12.json --create
+php artisan agent:token create --gym=<slug> --name="Assistent" --purpose="..." --abilities=all
+
+# danach bei jedem neuen Export
+php artisan agent:mirror import <datei.json>          # auf dem Server
+curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+     --data-binary @<datei.json> "$URL/api/v1/agent/mirror/import"   # von überall
+# oder im Browser: $URL/agent-api/upload.html
+```
+
+Was im Spiegel gilt:
+
+- **Lesen** funktioniert wie im Live-Betrieb, auf dem Stand des letzten Exports. `GET /health`
+  und `GET /mirror` nennen `mode: mirror` und das Alter der Daten.
+- **Schreiben** ändert den Spiegel nie, denn der nächste Import würde es still zurückdrehen.
+  Ein bestätigter Schreibaufruf wird zum **Auftrag** (`202`, `queued: true`): was zu tun ist,
+  für welches Mitglied, mit Link ins Portal (`AGENT_API_PORTAL_URL`). Ein Mensch trägt es im
+  Portal ein.
+- **Abgleich:** Der nächste Import schließt jeden Auftrag, dessen Wirkung der neue Export zeigt
+  (Kündigung eingetragen, Kontaktdaten geändert, Pause gesetzt, Notiz vorhanden). Was offen
+  bleibt, steht weiter in `GET /actions`.
+- **Grenzen des Exports:** Die Zutrittseinstellung (QR, NFC) und Zahlungsarten stehen nicht im
+  Export. `GET /members/{id}/access` sagt das (`access_medium_known: false`) und erfindet
+  keinen Grund. Mitglieder bekommen bei jedem Import neue IDs; stabil ist die Mitgliedsnummer.
+- **Schutz:** Ein Import in ein Studio mit eigenen Mitgliedern, das kein Spiegel ist, wird
+  abgelehnt.
+
+Der Spiegel braucht PHP 8.4 und eine Datenbank (MySQL oder SQLite), sonst nichts vom Portal:
+keine Zahlungsanbindung, kein Mailversand, keine Scanner.
+
 ## Endpunkte
 
 Basis: `/api/v1/agent`, Anmeldung per `Authorization: Bearer <Token>`. Vollständig in
@@ -54,6 +92,10 @@ Basis: `/api/v1/agent`, Anmeldung per `Authorization: Bearer <Token>`. Vollstän
 | GET | `/occupancy` | `stats.read` | Besuche je Wochentag und Stunde |
 | GET | `/stats` | `stats.read` | Kennzahlen des Studios (jede Umsatzzahl nur mit `payments.read`) |
 | GET | `/insights/inactive-members` | `stats.read` | laufender Vertrag, aber seit N Tagen kein Besuch |
+| GET | `/mirror` | – | Spiegel: Stand und Alter der Daten, offene Aufträge |
+| POST | `/mirror/import` | `mirror.write` | Studio-Export einspielen |
+| GET | `/actions` | `actions.read` | Aufträge, die im Portal auszuführen sind |
+| POST | `/actions/{id}/close` | `actions.write` | Auftrag als erledigt oder verworfen markieren |
 | PATCH | `/members/{id}` | `members.write` | Kontaktdaten ändern (ohne E-Mail, die ist der Login der Mitglieder-App) |
 | POST | `/members/{id}/notes` | `members.write` | Notiz am Mitglied anlegen |
 | POST | `/members/{id}/contract/cancellation` | `contracts.write` | ordentlich kündigen zum nächstmöglichen Termin |
@@ -95,7 +137,7 @@ curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/jso
 
 ## Für KI-Agenten: MCP-Server
 
-[`mcp/server.mjs`](mcp/server.mjs) stellt die API als 18 Werkzeuge über das Model Context
+[`mcp/server.mjs`](mcp/server.mjs) stellt die API als 21 Werkzeuge über das Model Context
 Protocol bereit (Node ab 18, keine Abhängigkeiten). Damit kann jeder MCP-fähige Agent
 (Desktop-Assistenten, n8n, eigene Agenten) direkt damit arbeiten:
 
@@ -117,13 +159,16 @@ Die Schreibwerkzeuge reichen `confirm` durch; ohne `confirm: true` bleibt es bei
 
 Neue Dateien: `routes/agent.php`, `app/Http/Controllers/Api/Agent/*`,
 `app/Http/Middleware/AuthenticateAgent.php`, `app/Models/GymApiClient.php`,
-`app/Models/AgentApiLog.php`, `app/Console/Commands/AgentTokenCommand.php`, eine Migration
-(zwei neue Tabellen, keine Änderung an bestehenden), `tests/Feature/Api/Agent/AgentApiTest.php`,
+`app/Models/AgentApiLog.php`, `app/Models/AgentMirrorSync.php`, `app/Models/AgentPendingAction.php`,
+`app/Services/AgentApi/MirrorService.php`, `app/Console/Commands/AgentTokenCommand.php`,
+`app/Console/Commands/AgentMirrorCommand.php`, `public/agent-api/upload.html`, zwei Migrationen
+(vier neue Tabellen, keine Änderung an bestehenden), `tests/Feature/Api/Agent/*`,
 `database/seeders/AgentApiDemoSeeder.php`.
 
-Geändert sind nur zwei bestehende Dateien, je um wenige Zeilen: `routes/api.php` lädt
+Geändert sind nur drei bestehende Dateien, je um wenige Zeilen: `routes/api.php` lädt
 `agent.php` im bestehenden `v1`-Block (Präfix `agent`), `bootstrap/app.php` kennt den Alias
-`agent.auth` und nimmt `api/v1/agent/*` von der CSRF-Prüfung aus.
+`agent.auth` und nimmt `api/v1/agent/*` von der CSRF-Prüfung aus, `config/services.php` kennt
+`agent_api.portal_url`.
 
 ```bash
 php artisan migrate
@@ -133,7 +178,7 @@ php artisan db:seed --class=AgentApiDemoSeeder   # erfundene Daten zum Ausprobie
 
 ## Tests
 
-31 Tests in `tests/Feature/Api/Agent/AgentApiTest.php` gegen die echte Fachlogik (SQLite im
+40 Tests in `tests/Feature/Api/Agent/` (31 zur API, 9 zum Spiegel) gegen die echte Fachlogik (SQLite im
 Speicher wie der Rest der Suite): Anmeldung, widerrufene und abgelaufene Tokens, Rechte,
 Mandantentrennung, Vertragsdaten, Zutritt, Auslastung, Kennzahlen, alle Schreibwege mit
 Vorschau und Ausführung, Protokoll, Kommandozeile,

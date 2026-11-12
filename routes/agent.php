@@ -20,6 +20,12 @@ Route::get('occupancy', [AgentReadController::class, 'occupancy'])->middleware('
 Route::get('stats', [AgentReadController::class, 'stats'])->middleware('agent.auth:stats.read')->name('stats');
 Route::get('insights/inactive-members', [AgentReadController::class, 'inactiveMembers'])->middleware('agent.auth:stats.read')->name('insights.inactive-members');
 
+// Mirror mode: data arrives as a studio export, confirmed writes wait as actions
+Route::get('mirror', [AgentReadController::class, 'mirrorStatus'])->middleware('agent.auth')->name('mirror.status');
+Route::post('mirror/import', [AgentWriteController::class, 'importMirror'])->middleware('agent.auth:mirror.write')->name('mirror.import');
+Route::get('actions', [AgentReadController::class, 'actions'])->middleware('agent.auth:actions.read')->name('actions.index');
+Route::post('actions/{actionId}/close', [AgentWriteController::class, 'closeAction'])->where(['actionId' => '[0-9]+'])->middleware('agent.auth:actions.write')->name('actions.close');
+
 Route::get('members', [AgentReadController::class, 'members'])->middleware('agent.auth:members.read')->name('members.index');
 Route::get('members/lookup', [AgentReadController::class, 'lookup'])->middleware('agent.auth:members.read')->name('members.lookup');
 

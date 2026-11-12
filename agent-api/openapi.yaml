@@ -31,12 +31,34 @@ components:
             message: { type: string }
   responses:
     Ok: { description: "success=true, Nutzdaten unter data" }
+    Queued: { description: "Spiegel: bestätigter Schreibaufruf wurde als Auftrag abgelegt (data.queued = true)" }
     Unauthenticated: { description: Token fehlt, ist unbekannt, widerrufen oder abgelaufen, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
     Forbidden: { description: Dem Token fehlt das Recht (error.required_ability) }
     NotFound: { description: Kein solches Mitglied in diesem Studio }
 paths:
   /health:
     get: { summary: Studio und Rechte des Tokens, responses: { '200': { $ref: '#/components/responses/Ok' }, '401': { $ref: '#/components/responses/Unauthenticated' } } }
+  /mirror:
+    get: { summary: "Spiegel: Stand und Alter der Daten, offene Aufträge", responses: { '200': { $ref: '#/components/responses/Ok' } } }
+  /mirror/import:
+    post:
+      summary: Studio-Export (JSON aus dem Portal) einspielen
+      x-ability: mirror.write
+      requestBody: { content: { application/json: { schema: { type: object, description: Der unveränderte Export } } } }
+      responses: { '200': { $ref: '#/components/responses/Ok' }, '422': { description: Kein gültiger Export oder Import abgelehnt } }
+  /actions:
+    get:
+      summary: Aufträge, die im Portal auszuführen sind
+      x-ability: actions.read
+      parameters: [ { name: status, in: query, schema: { type: string, enum: [open, done, dismissed, all], default: open } } ]
+      responses: { '200': { $ref: '#/components/responses/Ok' } }
+  /actions/{actionId}/close:
+    post:
+      summary: Auftrag als erledigt oder verworfen markieren
+      x-ability: actions.write
+      parameters: [ { name: actionId, in: path, required: true, schema: { type: integer } } ]
+      requestBody: { content: { application/json: { schema: { type: object, required: [status], properties: { status: { type: string, enum: [done, dismissed] } } } } } }
+      responses: { '200': { $ref: '#/components/responses/Ok' }, '409': { description: Bereits geschlossen } }
   /plans:
     get: { summary: Aktive Tarife, x-ability: plans.read, responses: { '200': { $ref: '#/components/responses/Ok' } } }
   /members:

@@ -23,6 +23,9 @@ const confirm = {
 
 const TOOLS = [
   { name: 'health', description: 'Which gym this token belongs to and what it may do.', props: {}, call: () => ['GET', 'health'] },
+  { name: 'get_mirror_status', description: 'Whether this gym is a mirror of an export, how old the data is and how many confirmed writes still wait for a human.', props: {}, call: () => ['GET', 'mirror'] },
+  { name: 'list_pending_actions', description: 'Confirmed writes that wait for a human to carry them out in the portal (mirror mode). status: open (default), done, dismissed or all.', props: { status: { type: 'string' } }, call: (a) => ['GET', 'actions', pick(a, ['status'])] },
+  { name: 'close_pending_action', description: 'Mark a pending action as done (carried out in the portal) or dismissed.', props: { action_id: { type: 'integer' }, status: { type: 'string', description: 'done or dismissed' } }, required: ['action_id', 'status'], call: (a) => ['POST', `actions/${num(a.action_id)}/close`, null, { status: a.status }] },
   { name: 'list_plans', description: 'Active membership plans with price, commitment and notice period.', props: {}, call: () => ['GET', 'plans'] },
   {
     name: 'find_member',
@@ -92,7 +95,7 @@ function omit(obj, keys) {
 
 function num(value) {
   const n = Number(value);
-  if (!Number.isInteger(n) || n < 1) throw new Error('member_id must be a positive integer');
+  if (!Number.isInteger(n) || n < 1) throw new Error('id must be a positive integer');
   return n;
 }
 

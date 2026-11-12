@@ -5,7 +5,9 @@ namespace App\Http\Controllers\Api\Agent;
 use App\Events\ContractCancelled;
 use App\Mail\CancellationConfirmationMail;
 use App\Mail\Dispatching\MemberMailDispatcher;
+use App\Models\AgentPendingAction;
 use App\Models\Member;
+use App\Services\AgentApi\MirrorService;
 use App\Services\MembershipService;
 use Carbon\Carbon;
 use Illuminate\Http\JsonResponse;
@@ -76,6 +78,10 @@ class AgentWriteController extends AgentController
             return $this->ok(['preview' => true, 'changes' => $changes]);
         }
 
+        if ($queued = $this->queueIfMirror($request, $member, 'update_member', array_map(static fn (array $c) => $c['to'], $changes), ['changes' => $changes])) {
+            return $queued;
+        }
+
         $member->update(array_map(static fn (array $change) => $change['to'], $changes));
 
         $this->markChanged($request, 'member updated: '.implode(', ', array_keys($changes)), $changes);
@@ -107,6 +113,10 @@ class AgentWriteController extends AgentController
 
         if (! $this->confirmed($request)) {
             return $this->ok(['preview' => true, 'note' => $line]);
+        }
+
+        if ($queued = $this->queueIfMirror($request, $member, 'add_note', ['text' => trim($validated['text'])], ['note' => $line])) {
+            return $queued;
         }
 
         $previous = $member->notes;
@@ -193,6 +203,10 @@ class AgentWriteController extends AgentController
             ]);
         }
 
+        if ($queued = $this->queueIfMirror($request, $member, 'cancel_contract', ['reason' => $reasonKey, 'note' => $note, 'received_at' => now()->toIso8601String()], ['cancellation' => $effect])) {
+            return $queued;
+        }
+
         DB::transaction(function () use ($membership, $effectiveDate, $reasonText, $membershipService, $request) {
             $membership->update([
                 'cancellation_date' => $effectiveDate,
@@ -256,6 +270,10 @@ class AgentWriteController extends AgentController
 
         if (! $this->confirmed($request)) {
             return $this->ok(['preview' => true, 'revocation' => $effect]);
+        }
+
+        if ($queued = $this->queueIfMirror($request, $member, 'revoke_cancellation', [], ['revocation' => $effect])) {
+            return $queued;
         }
 
         $previousReason = $membership->cancellation_reason;
@@ -328,6 +346,10 @@ class AgentWriteController extends AgentController
             return $this->ok(['preview' => true, 'pause' => $effect]);
         }
 
+        if ($queued = $this->queueIfMirror($request, $member, 'pause_contract', ['start_date' => $effect['start_date'], 'end_date' => $effect['end_date'], 'reason' => $validated['reason'] ?? null], ['pause' => $effect])) {
+            return $queued;
+        }
+
         $previousEndDate = $this->dateString($membership->getRawOriginal('end_date'));
 
         $membership = $membershipService->pause(
@@ -378,6 +400,10 @@ class AgentWriteController extends AgentController
             return $this->ok(['preview' => true, 'resume' => ['membership_id' => $membership->id]]);
         }
 
+        if ($queued = $this->queueIfMirror($request, $member, 'resume_contract', [], ['resume' => ['membership_id' => $membership->id]])) {
+            return $queued;
+        }
+
         $previousPause = [
             $this->dateString($membership->getRawOriginal('pause_start_date')),
             $this->dateString($membership->getRawOriginal('pause_end_date')),
@@ -403,6 +429,86 @@ class AgentWriteController extends AgentController
     private function confirmed(Request $request): bool
     {
         return $request->isJson() && $request->json('confirm') === true;
+    }
+
+    /**
+     * In a mirror nothing may be written: the next import would silently undo
+     * it. The confirmed request becomes a pending action instead, which a
+     * human carries out in the source portal.
+     */
+    private function queueIfMirror(Request $request, Member $member, string $type, array $payload, array $effect): ?JsonResponse
+    {
+        $mirror = $this->mirror($request);
+
+        if (! $mirror) {
+            return null;
+        }
+
+        $action = AgentPendingAction::create([
+            'gym_id' => $member->gym_id,
+            'gym_api_client_id' => $this->client($request)->id,
+            'type' => $type,
+            'member_number' => $member->member_number,
+            'member_name' => trim($member->first_name.' '.$member->last_name),
+            'portal_member_id' => ($mirror->portal_member_ids ?? [])[$member->member_number] ?? null,
+            'payload' => $payload,
+            'effect' => $effect,
+        ]);
+
+        $request->attributes->set('agent_summary', 'queued '.$type.' as action '.$action->id);
+
+        return response()->json([
+            'success' => true,
+            'data' => ['preview' => false, 'queued' => true, 'action' => $this->presentAction($action)] + $effect,
+        ], 202);
+    }
+
+    public function closeAction(Request $request, string $actionId): JsonResponse
+    {
+        $validated = $request->validate(['status' => 'required|in:done,dismissed']);
+
+        $action = AgentPendingAction::where('gym_id', $this->gym($request)->id)->whereKey($actionId)->first();
+
+        if (! $action) {
+            return $this->fail('action_not_found', 'No such action in this gym.', 404);
+        }
+
+        if ($action->status !== AgentPendingAction::STATUS_OPEN) {
+            return $this->fail('action_closed', 'This action is already closed.', 409);
+        }
+
+        $action->close($validated['status'], 'manual');
+        $this->markChanged($request, 'action '.$action->id.' marked '.$validated['status']);
+
+        return $this->ok(['action' => $this->presentAction($action->fresh())]);
+    }
+
+    /**
+     * Takes a studio export (the JSON from Settings > data transfer) and
+     * replaces the mirrored data with it.
+     */
+    public function importMirror(Request $request, MirrorService $mirrorService): JsonResponse
+    {
+        $data = $request->json()->all();
+
+        if (! is_array($data) || ! isset($data['export_metadata'])) {
+            return $this->fail('not_an_export', 'The body must be a gymportal studio export (JSON).', 422);
+        }
+
+        try {
+            $result = $mirrorService->import($data, $this->gym($request), 'api:'.$this->client($request)->name);
+        } catch (\InvalidArgumentException $e) {
+            return $this->fail('import_refused', $e->getMessage(), 422);
+        }
+
+        $this->markChanged($request, 'mirror import '.$result['sync']->id);
+
+        return $this->ok([
+            'sync_id' => $result['sync']->id,
+            'exported_at' => optional($result['sync']->exported_at)->toIso8601String(),
+            'stats' => $result['sync']->stats,
+            'actions_closed' => $result['sync']->actions_closed,
+        ]);
     }
 
     private function markChanged(Request $request, string $summary, ?array $changes = null): void

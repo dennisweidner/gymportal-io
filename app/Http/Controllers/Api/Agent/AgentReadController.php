@@ -2,6 +2,7 @@
 
 namespace App\Http\Controllers\Api\Agent;
 
+use App\Models\AgentPendingAction;
 use App\Models\CheckIn;
 use App\Models\Member;
 use App\Models\MembershipPlan;
@@ -26,10 +27,15 @@ class AgentReadController extends AgentController
     {
         $client = $this->client($request);
         $gym = $this->gym($request);
+        $mirror = $this->mirror($request);
 
         return $this->ok([
             'api' => 'gymportal-agent-api',
             'version' => self::VERSION,
+            // live: this installation is the system of record. mirror: the data
+            // is a copy of an export and confirmed writes become pending actions.
+            'mode' => $mirror ? 'mirror' : 'live',
+            'data_as_of' => $mirror ? optional($mirror->exported_at ?? $mirror->created_at)->toIso8601String() : now()->toIso8601String(),
             'gym' => ['id' => $gym->id, 'name' => $gym->name, 'slug' => $gym->slug],
             'client' => [
                 'name' => $client->name,
@@ -220,11 +226,15 @@ class AgentReadController extends AgentController
             $blockers[] = ['code' => 'no_active_membership', 'detail' => 'No membership that is active today.'];
         }
 
-        if ($config && ! $config->qr_code_enabled && ! $config->nfc_enabled) {
+        // The studio export carries no access configuration, so a mirror
+        // cannot judge the access medium and must not invent a blocker.
+        $configKnown = ! $this->mirror($request);
+
+        if ($configKnown && $config && ! $config->qr_code_enabled && ! $config->nfc_enabled) {
             $blockers[] = ['code' => 'no_access_medium_enabled', 'detail' => 'Neither QR code nor NFC is enabled.'];
         }
 
-        if (! $config) {
+        if ($configKnown && ! $config) {
             $blockers[] = ['code' => 'no_access_config', 'detail' => 'No access configuration exists yet.'];
         }
 
@@ -237,6 +247,7 @@ class AgentReadController extends AgentController
             'member' => ['id' => $member->id, 'status' => $member->status],
             'should_have_access' => $blockers === [],
             'blockers' => $blockers,
+            'access_medium_known' => $configKnown,
             'access' => [
                 'qr_code_enabled' => $config ? (bool) $config->qr_code_enabled : null,
                 'qr_code_invalidated_at' => $config ? $this->dateTimeString($config->getRawOriginal('qr_code_invalidated_at')) : null,
@@ -448,6 +459,44 @@ class AgentReadController extends AgentController
             'threshold_days' => $days,
             'count' => $members->count(),
             'members' => $members->take($limit)->all(),
+        ]);
+    }
+
+    public function actions(Request $request): JsonResponse
+    {
+        $status = $request->query('status', AgentPendingAction::STATUS_OPEN);
+
+        $query = AgentPendingAction::where('gym_id', $this->gym($request)->id)->orderBy('id');
+
+        if ($status !== 'all') {
+            $query->where('status', $status);
+        }
+
+        $actions = $query->limit(200)->get();
+
+        return $this->ok([
+            'count' => $actions->count(),
+            'actions' => $actions->map(fn (AgentPendingAction $a) => $this->presentAction($a))->all(),
+        ]);
+    }
+
+    public function mirrorStatus(Request $request): JsonResponse
+    {
+        $mirror = $this->mirror($request);
+
+        if (! $mirror) {
+            return $this->ok(['mode' => 'live']);
+        }
+
+        return $this->ok([
+            'mode' => 'mirror',
+            'exported_at' => optional($mirror->exported_at)->toIso8601String(),
+            'imported_at' => optional($mirror->created_at)->toIso8601String(),
+            'age_hours' => $mirror->exported_at ? round($mirror->exported_at->diffInMinutes(now()) / 60, 1) : null,
+            'source' => $mirror->source,
+            'stats' => $mirror->stats,
+            'actions_closed_by_this_import' => $mirror->actions_closed,
+            'open_actions' => AgentPendingAction::where('gym_id', $mirror->gym_id)->where('status', AgentPendingAction::STATUS_OPEN)->count(),
         ]);
     }
 

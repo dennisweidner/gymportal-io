@@ -2,6 +2,11 @@
 
 return [
 
+    'agent_api' => [
+        // Base URL of the portal a mirror copies, for deep links in pending actions.
+        'portal_url' => env('AGENT_API_PORTAL_URL'),
+    ],
+
     /*
     |--------------------------------------------------------------------------
     | Third Party Services

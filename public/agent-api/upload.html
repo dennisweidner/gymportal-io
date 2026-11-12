@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>Studio-Export einspielen</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 16px/1.5 system-ui, sans-serif; max-width: 34rem; margin: 3rem auto; padding: 0 1rem; }
+  h1 { font-size: 1.4rem; }
+  label { display: block; margin-top: 1.2rem; font-weight: 600; }
+  input { width: 100%; box-sizing: border-box; padding: .6rem; font: inherit; margin-top: .3rem; }
+  button { margin-top: 1.5rem; padding: .7rem 1.2rem; font: inherit; font-weight: 600; cursor: pointer; }
+  #result { margin-top: 1.5rem; white-space: pre-wrap; }
+  .hint { color: #777; font-size: .9rem; }
+</style>
+</head>
+<body>
+<h1>Studio-Export einspielen</h1>
+<p>Im Portal unter Einstellungen, Datentransfer den Export als JSON herunterladen und hier hochladen. Die Daten ersetzen den bisherigen Stand des Spiegels.</p>
+<form id="form">
+  <label for="token">Zugangsschlüssel</label>
+  <input id="token" type="password" autocomplete="off" required>
+  <p class="hint">Wird nur für diesen Upload benutzt und nicht gespeichert.</p>
+  <label for="file">Exportdatei (gym_export_….json)</label>
+  <input id="file" type="file" accept="application/json,.json" required>
+  <button type="submit">Einspielen</button>
+</form>
+<div id="result" role="status"></div>
+<script>
+const form = document.getElementById('form');
+const result = document.getElementById('result');
+form.addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const file = document.getElementById('file').files[0];
+  const token = document.getElementById('token').value.trim();
+  result.textContent = 'Wird eingespielt …';
+  try {
+    const text = await file.text();
+    JSON.parse(text);
+    const response = await fetch('/api/v1/agent/mirror/import', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json', Accept: 'application/json' },
+      body: text,
+    });
+    const json = await response.json();
+    if (!json.success) {
+      result.textContent = 'Nicht eingespielt: ' + (json.error?.message || response.status);
+      return;
+    }
+    const s = json.data.stats;
+    result.textContent = 'Eingespielt. ' + s.members + ' Mitglieder, ' + s.memberships + ' Verträge, ' + s.payments
+      + ' Zahlungen, ' + s.check_ins + ' Besuche.\nErledigte Aufträge erkannt: ' + json.data.actions_closed + '.';
+    form.reset();
+  } catch (error) {
+    result.textContent = 'Nicht eingespielt: ' + error.message;
+  }
+});
+</script>
+</body>
+</html>

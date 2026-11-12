@@ -3,6 +3,8 @@
 namespace App\Http\Controllers\Api\Agent;
 
 use App\Http\Controllers\Controller;
+use App\Models\AgentMirrorSync;
+use App\Models\AgentPendingAction;
 use App\Models\Gym;
 use App\Models\GymApiClient;
 use App\Models\Member;
@@ -63,6 +65,39 @@ abstract class AgentController extends Controller
         }
 
         return $active->is_free_trial ? $active->linkedPaidMembership : $active;
+    }
+
+    /**
+     * The last import when this gym mirrors another installation, else null.
+     * Resolved once per request.
+     */
+    protected function mirror(Request $request): ?AgentMirrorSync
+    {
+        if (! $request->attributes->has('agent_mirror')) {
+            $request->attributes->set('agent_mirror', AgentMirrorSync::latestFor($this->gym($request)->id));
+        }
+
+        return $request->attributes->get('agent_mirror');
+    }
+
+    protected function presentAction(AgentPendingAction $action): array
+    {
+        $portal = rtrim((string) config('services.agent_api.portal_url'), '/');
+
+        return [
+            'id' => $action->id,
+            'type' => $action->type,
+            'status' => $action->status,
+            'member_number' => $action->member_number,
+            'member_name' => $action->member_name,
+            'portal_member_id' => $action->portal_member_id,
+            'portal_url' => $portal !== '' && $action->portal_member_id ? $portal.'/members/'.$action->portal_member_id : null,
+            'payload' => $action->payload,
+            'effect' => $action->effect,
+            'created_at' => optional($action->created_at)->toIso8601String(),
+            'closed_at' => optional($action->closed_at)->toIso8601String(),
+            'closed_by' => $action->closed_by,
+        ];
     }
 
     protected function ok(array $data, array $meta = []): JsonResponse
