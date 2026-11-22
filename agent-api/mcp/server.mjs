@@ -7,7 +7,8 @@
 //   GYMPORTAL_API_URL    e.g. https://app.example.org   (no trailing slash)
 //   GYMPORTAL_API_TOKEN  token from `php artisan agent:token create`
 //
-// What a token may do at all is decided by its abilities on the server, not here.
+// Write tools only preview unless the model passes confirm=true. What a token
+// may do at all is decided by its abilities on the server, not here.
 
 import { createInterface } from 'node:readline';
 
@@ -15,6 +16,10 @@ const BASE = (process.env.GYMPORTAL_API_URL || '').replace(/\/+$/, '');
 const TOKEN = process.env.GYMPORTAL_API_TOKEN || '';
 
 const id = { type: 'integer', description: 'Member id (from find_member or list_members)' };
+const confirm = {
+  type: 'boolean',
+  description: 'false or omitted: only show what would happen. true: really do it. Ask the human before passing true.',
+};
 
 const TOOLS = [
   { name: 'health', description: 'Which gym this token belongs to and what it may do.', props: {}, call: () => ['GET', 'health'] },
@@ -47,11 +52,41 @@ const TOOLS = [
   { name: 'get_occupancy', description: 'Visits by weekday and hour. Says insufficient_data instead of recommending an hour when there are too few visits.', props: { days: { type: 'integer' } }, call: (a) => ['GET', 'occupancy', pick(a, ['days'])] },
   { name: 'get_stats', description: 'Key figures of the gym: members, new sign-ups, status distribution, plans, revenue (revenue needs payments.read).', props: {}, call: () => ['GET', 'stats'] },
   { name: 'list_inactive_members', description: 'Members with a running contract who have not visited for N days: candidates for churn.', props: { days: { type: 'integer' }, limit: { type: 'integer' } }, call: (a) => ['GET', 'insights/inactive-members', pick(a, ['days', 'limit'])] },
+  {
+    name: 'update_member_contact',
+    description: 'Change contact data of a member (phone, address, postal_code, city, country, emergency contact). The e-mail address is the member app login and can only be changed in the portal.',
+    props: { member_id: id, confirm, phone: { type: 'string' }, address: { type: 'string' }, address_addition: { type: 'string' }, postal_code: { type: 'string' }, city: { type: 'string' }, country: { type: 'string' }, emergency_contact_name: { type: 'string' }, emergency_contact_phone: { type: 'string' } },
+    required: ['member_id'],
+    call: (a) => ['PATCH', `members/${num(a.member_id)}`, null, omit(a, ['member_id'])],
+  },
+  { name: 'add_member_note', description: 'Append a dated note to the member record.', props: { member_id: id, confirm, text: { type: 'string' } }, required: ['member_id', 'text'], call: (a) => ['POST', `members/${num(a.member_id)}/notes`, null, omit(a, ['member_id'])] },
+  {
+    name: 'cancel_contract',
+    description: 'Ordinary cancellation to the next possible date. reason: move | financial | health | dissatisfied | no_time | other.',
+    props: { member_id: id, confirm, reason: { type: 'string' }, note: { type: 'string' }, send_confirmation: { type: 'boolean', description: 'Send the confirmation mail to the member.' }, expected_effective_date: { type: 'string', description: 'Required with confirm=true: the effective_date from the preview. If it moved, nothing is stored and the new date comes back.' } },
+    required: ['member_id'],
+    call: (a) => ['POST', `members/${num(a.member_id)}/contract/cancellation`, null, omit(a, ['member_id'])],
+  },
+  { name: 'revoke_cancellation', description: 'Take back a cancellation that has not taken effect yet.', props: { member_id: id, confirm }, required: ['member_id'], call: (a) => ['DELETE', `members/${num(a.member_id)}/contract/cancellation`, null, omit(a, ['member_id'])] },
+  {
+    name: 'pause_contract',
+    description: 'Pause the active membership from start_date to end_date (YYYY-MM-DD).',
+    props: { member_id: id, confirm, start_date: { type: 'string' }, end_date: { type: 'string' }, reason: { type: 'string' } },
+    required: ['member_id', 'start_date', 'end_date'],
+    call: (a) => ['POST', `members/${num(a.member_id)}/contract/pause`, null, omit(a, ['member_id'])],
+  },
+  { name: 'resume_contract', description: 'End a pause as of today.', props: { member_id: id, confirm }, required: ['member_id'], call: (a) => ['POST', `members/${num(a.member_id)}/contract/resume`, null, omit(a, ['member_id'])] },
 ];
 
 function pick(obj, keys) {
   const out = {};
   for (const k of keys) if (obj[k] !== undefined && obj[k] !== null && obj[k] !== '') out[k] = obj[k];
+  return out;
+}
+
+function omit(obj, keys) {
+  const out = { ...obj };
+  for (const k of keys) delete out[k];
   return out;
 }
 

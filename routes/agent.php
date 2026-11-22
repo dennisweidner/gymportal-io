@@ -1,6 +1,7 @@
 <?php
 
 use App\Http\Controllers\Api\Agent\AgentReadController;
+use App\Http\Controllers\Api\Agent\AgentWriteController;
 use Illuminate\Support\Facades\Route;
 
 /*
@@ -28,4 +29,12 @@ Route::prefix('members/{memberId}')->where(['memberId' => '[0-9]+'])->name('memb
     Route::get('access', [AgentReadController::class, 'access'])->middleware('agent.auth:access.read')->name('access');
     Route::get('check-ins', [AgentReadController::class, 'checkIns'])->middleware('agent.auth:access.read')->name('check-ins');
     Route::get('payments', [AgentReadController::class, 'payments'])->middleware('agent.auth:payments.read')->name('payments');
+
+    // Writes: preview unless the body carries "confirm": true
+    Route::patch('/', [AgentWriteController::class, 'updateMember'])->middleware('agent.auth:members.write')->name('update');
+    Route::post('notes', [AgentWriteController::class, 'addNote'])->middleware('agent.auth:members.write')->name('notes.store');
+    Route::post('contract/cancellation', [AgentWriteController::class, 'cancel'])->middleware('agent.auth:contracts.write')->name('contract.cancel');
+    Route::delete('contract/cancellation', [AgentWriteController::class, 'revokeCancellation'])->middleware('agent.auth:contracts.write')->name('contract.revoke-cancellation');
+    Route::post('contract/pause', [AgentWriteController::class, 'pause'])->middleware('agent.auth:contracts.write')->name('contract.pause');
+    Route::post('contract/resume', [AgentWriteController::class, 'resume'])->middleware('agent.auth:contracts.write')->name('contract.resume');
 });

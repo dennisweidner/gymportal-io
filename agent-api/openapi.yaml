@@ -4,7 +4,8 @@ info:
   version: 1.0.0
   description: >
     Schnittstelle für KI-Agenten und Automatisierungen eines Studios. Das Studio
-    ergibt sich aus dem Token, jeder Bereich hat ein eigenes Leserecht.
+    ergibt sich aus dem Token. Schreibende Aufrufe liefern ohne "confirm": true
+    nur eine Vorschau und ändern nichts.
 servers:
   - url: /api/v1/agent
 security:
@@ -15,6 +16,10 @@ components:
   parameters:
     memberId: { name: memberId, in: path, required: true, schema: { type: integer } }
   schemas:
+    Confirm:
+      type: object
+      properties:
+        confirm: { type: boolean, description: "false oder leer: Vorschau. true: ausführen." }
     Error:
       type: object
       properties:
@@ -56,9 +61,93 @@ paths:
   /members/{memberId}:
     parameters: [ { $ref: '#/components/parameters/memberId' } ]
     get: { summary: Stammdaten, x-ability: members.read, responses: { '200': { $ref: '#/components/responses/Ok' }, '404': { $ref: '#/components/responses/NotFound' } } }
+    patch:
+      summary: Kontaktdaten ändern
+      x-ability: members.write
+      requestBody:
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/Confirm'
+                - type: object
+                  properties:
+                    phone: { type: string }
+                    address: { type: string }
+                    address_addition: { type: string }
+                    postal_code: { type: string }
+                    city: { type: string }
+                    country: { type: string }
+                    emergency_contact_name: { type: string }
+                    emergency_contact_phone: { type: string }
+      responses: { '200': { $ref: '#/components/responses/Ok' }, '422': { description: "Nichts zu ändern, ungültig, oder email gesendet (email_change_not_supported: die E-Mail ist der Login der Mitglieder-App)" } }
+  /members/{memberId}/notes:
+    parameters: [ { $ref: '#/components/parameters/memberId' } ]
+    post:
+      summary: Notiz am Mitglied anlegen
+      x-ability: members.write
+      requestBody:
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/Confirm'
+                - type: object
+                  required: [text]
+                  properties:
+                    text: { type: string, maxLength: 1000 }
+      responses: { '200': { $ref: '#/components/responses/Ok' } }
   /members/{memberId}/contract:
     parameters: [ { $ref: '#/components/parameters/memberId' } ]
     get: { summary: "Vertrag mit Kündigungstermin, Frist, Pause, Widerruf", x-ability: contracts.read, responses: { '200': { $ref: '#/components/responses/Ok' } } }
+  /members/{memberId}/contract/cancellation:
+    parameters: [ { $ref: '#/components/parameters/memberId' } ]
+    post:
+      summary: Ordentliche Kündigung zum nächstmöglichen Termin
+      x-ability: contracts.write
+      requestBody:
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/Confirm'
+                - type: object
+                  properties:
+                    reason: { type: string, enum: [move, financial, health, dissatisfied, no_time, other] }
+                    note: { type: string }
+                    send_confirmation: { type: boolean }
+                    expected_effective_date: { type: string, format: date, description: "Pflicht mit confirm=true: effective_date aus der Vorschau" }
+      responses: { '200': { $ref: '#/components/responses/Ok' }, '409': { description: "Bereits gekündigt, oder effective_date_changed: das Datum ist nicht mehr das der Vorschau" }, '422': { description: "Kein kündbarer Vertrag, oder expected_effective_date fehlt" } }
+    delete:
+      summary: Kündigung zurücknehmen
+      x-ability: contracts.write
+      requestBody: { content: { application/json: { schema: { $ref: '#/components/schemas/Confirm' } } } }
+      responses: { '200': { $ref: '#/components/responses/Ok' }, '422': { description: Keine offene Kündigung } }
+  /members/{memberId}/contract/pause:
+    parameters: [ { $ref: '#/components/parameters/memberId' } ]
+    post:
+      summary: Vertrag pausieren
+      x-ability: contracts.write
+      requestBody:
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/Confirm'
+                - type: object
+                  required: [start_date, end_date]
+                  properties:
+                    start_date: { type: string, format: date }
+                    end_date: { type: string, format: date }
+                    reason: { type: string }
+      responses: { '200': { $ref: '#/components/responses/Ok' }, '422': { description: Nicht pausierbar oder Datum ungültig } }
+  /members/{memberId}/contract/resume:
+    parameters: [ { $ref: '#/components/parameters/memberId' } ]
+    post:
+      summary: Pause beenden
+      x-ability: contracts.write
+      requestBody: { content: { application/json: { schema: { $ref: '#/components/schemas/Confirm' } } } }
+      responses: { '200': { $ref: '#/components/responses/Ok' }, '422': { description: Nicht pausiert } }
   /members/{memberId}/access:
     parameters: [ { $ref: '#/components/parameters/memberId' } ]
     get: { summary: "Zutritt: sollte es gehen, und wenn nicht, warum", x-ability: access.read, responses: { '200': { $ref: '#/components/responses/Ok' } } }
