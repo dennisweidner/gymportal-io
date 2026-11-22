@@ -142,6 +142,15 @@ class WidgetService
             $membership = $membershipResult['membership'];
             $freeMembership = $membershipResult['free_membership'];
 
+            // Keep evidence of the legal texts the customer confirmed at checkout
+            if (! empty($data['legal_texts_acknowledged'])) {
+                $membership->update([
+                    'metadata' => array_merge($membership->metadata ?? [], [
+                        'legal_acknowledgement' => $this->legalAcknowledgement($gym, $data),
+                    ]),
+                ]);
+            }
+
             $registration = WidgetRegistration::where('gym_id', $gym->id)
                 ->where('session_id', session()->getId())
                 ->where('status', 'pending')
@@ -820,6 +829,22 @@ class WidgetService
                 'action_required' => false,
             ]
         };
+    }
+
+    /**
+     * When and from where the customer confirmed the legal texts at checkout,
+     * and which documents the gym linked at that moment. A later change of a
+     * URL in the settings does not alter what was agreed.
+     */
+    private function legalAcknowledgement(Gym $gym, array $data): array
+    {
+        return [
+            'acknowledged_at' => Carbon::now()->toIso8601String(),
+            'source' => 'widget',
+            'widget_session' => $data['widget_session'] ?? null,
+            'ip_address' => request()->ip(),
+            'documents' => $gym->getLegalUrlsArray(),
+        ];
     }
 
     /**
