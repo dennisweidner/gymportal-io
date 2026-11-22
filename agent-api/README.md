@@ -1,7 +1,9 @@
 # Agent API für gymportal
 
 Eine Schnittstelle, über die KI-Agenten und Automatisierungen für **ein Studio** auf gymportal
-zugreifen: Fragen zu Mitgliedern, Verträgen, Zutritt, Zahlungen und Auslastung beantworten.
+zugreifen: Fragen zu Mitgliedern, Verträgen, Zutritt, Zahlungen und Auslastung beantworten,
+und auf Wunsch schreiben (Kontaktdaten ändern, kündigen, Kündigung zurücknehmen, pausieren,
+fortsetzen, Notiz anlegen).
 
 Aufsatz auf [mariokehl/gymportal-io](https://github.com/mariokehl/gymportal-io), Stand `develop`
 v0.0.156. Lizenz wie das Projekt: GPL-3.0.
@@ -15,18 +17,23 @@ abnimmt, hat damit keinen Zugang. Diese API schließt die Lücke, ohne Fachlogik
 Kündigungstermine, Fristen und Pausenregeln kommen aus denselben Modellen und Diensten, die
 Portal und Mitglieder-App benutzen.
 
-## Zwei Zusagen
+## Drei Zusagen
 
 1. **Das Studio kommt aus dem Token.** Ein Token gehört zu genau einem Studio. Nichts im
    Aufruf kann ein anderes Studio wählen; ein Mitglied eines anderen Studios existiert für
    das Token nicht (404).
-2. **Ein Token kann nur, was seine Rechte sagen.** Jeder Bereich hat ein eigenes Leserecht.
-   Ein Agent, der nur Tarife kennen muss, sieht keine Mitglieder. Hat das Studio weder
+2. **Ein Token kann nur, was seine Rechte sagen.** Lesen und Schreiben sind getrennt. Ein
+   Agent, der nur Fragen beantwortet, bekommt kein Schreibrecht. Hat das Studio weder
    Testphase noch Abo, antwortet die API wie das Portal nicht mehr (403 `gym_without_access`).
+3. **Schreiben ist zweistufig.** Ohne `"confirm": true` liefert jeder schreibende Aufruf nur
+   die Vorschau (`"preview": true`) und ändert nichts. So kann der Agent dem Menschen den
+   genauen Effekt zeigen, bevor etwas gespeichert wird. `confirm` zählt nur im JSON-Körper,
+   nie in der Adresse. Eine Kündigung nennt beim Bestätigen das Datum der Vorschau
+   (`expected_effective_date`); hat es sich verschoben, wird nichts gespeichert (409).
 
 Dazu ein Protokoll: jede Anfrage landet in `agent_api_logs` (wer, was, welches Mitglied,
-Statuscode), ohne Inhalte der Antwort. Die Spalten `changed_data` und `changes` sind für
-schreibende Aufrufe vorgesehen und bleiben beim Lesen leer.
+Statuscode, ob Daten geändert wurden). Bei einem ausgeführten Schreibvorgang stehen alter und
+neuer Wert dabei, sonst keine Inhalte.
 
 ## Endpunkte
 
@@ -47,6 +54,12 @@ Basis: `/api/v1/agent`, Anmeldung per `Authorization: Bearer <Token>`. Vollstän
 | GET | `/occupancy` | `stats.read` | Besuche je Wochentag und Stunde |
 | GET | `/stats` | `stats.read` | Kennzahlen des Studios (jede Umsatzzahl nur mit `payments.read`) |
 | GET | `/insights/inactive-members` | `stats.read` | laufender Vertrag, aber seit N Tagen kein Besuch |
+| PATCH | `/members/{id}` | `members.write` | Kontaktdaten ändern (ohne E-Mail, die ist der Login der Mitglieder-App) |
+| POST | `/members/{id}/notes` | `members.write` | Notiz am Mitglied anlegen |
+| POST | `/members/{id}/contract/cancellation` | `contracts.write` | ordentlich kündigen zum nächstmöglichen Termin |
+| DELETE | `/members/{id}/contract/cancellation` | `contracts.write` | Kündigung zurücknehmen |
+| POST | `/members/{id}/contract/pause` | `contracts.write` | pausieren von/bis |
+| POST | `/members/{id}/contract/resume` | `contracts.write` | Pause beenden |
 
 Antworten haben immer dieselbe Hülle: `{"success": true, "data": {...}}` oder
 `{"success": false, "error": {"code": "...", "message": "..."}}`.
@@ -60,7 +73,7 @@ php artisan agent:token list --gym=<id oder slug>
 php artisan agent:token revoke --id=<id>
 ```
 
-`--abilities` nimmt `read`, `all` oder eine Liste wie `members.read,contracts.read`.
+`--abilities` nimmt `read`, `all` oder eine Liste wie `members.read,contracts.read,contracts.write`.
 Das Token wird einmal angezeigt und nur als Hash gespeichert. `--expires=2027-01-31` setzt ein
 Ablaufdatum. Der Zweck ist Pflicht, weil er ins Verzeichnis der Verarbeitungstätigkeiten gehört.
 
@@ -69,11 +82,20 @@ Ablaufdatum. Der Zweck ist Pflicht, weil er ins Verzeichnis der Verarbeitungstä
 ```bash
 curl -H "Authorization: Bearer $TOKEN" "$URL/api/v1/agent/members/lookup?email=mia@example.org"
 curl -H "Authorization: Bearer $TOKEN" "$URL/api/v1/agent/members/7/contract"
+
+# Vorschau: ändert nichts
+curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+     -d '{"reason":"move"}' "$URL/api/v1/agent/members/7/contract/cancellation"
+
+# Ausführen
+curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+     -d '{"reason":"move","confirm":true,"expected_effective_date":"2027-01-31","send_confirmation":true}' \
+     "$URL/api/v1/agent/members/7/contract/cancellation"
 ```
 
 ## Für KI-Agenten: MCP-Server
 
-[`mcp/server.mjs`](mcp/server.mjs) stellt die API als 12 Werkzeuge über das Model Context
+[`mcp/server.mjs`](mcp/server.mjs) stellt die API als 18 Werkzeuge über das Model Context
 Protocol bereit (Node ab 18, keine Abhängigkeiten). Damit kann jeder MCP-fähige Agent
 (Desktop-Assistenten, n8n, eigene Agenten) direkt damit arbeiten:
 
@@ -88,6 +110,8 @@ Protocol bereit (Node ab 18, keine Abhängigkeiten). Damit kann jeder MCP-fähig
   }
 }
 ```
+
+Die Schreibwerkzeuge reichen `confirm` durch; ohne `confirm: true` bleibt es bei der Vorschau.
 
 ## Einbau in gymportal
 
@@ -109,7 +133,8 @@ php artisan db:seed --class=AgentApiDemoSeeder   # erfundene Daten zum Ausprobie
 
 ## Tests
 
-21 Tests in `tests/Feature/Api/Agent/AgentApiTest.php` gegen die echte Fachlogik (SQLite im
+31 Tests in `tests/Feature/Api/Agent/AgentApiTest.php` gegen die echte Fachlogik (SQLite im
 Speicher wie der Rest der Suite): Anmeldung, widerrufene und abgelaufene Tokens, Rechte,
-Mandantentrennung, Vertragsdaten, Zutritt, Auslastung, Kennzahlen, Protokoll, Kommandozeile,
+Mandantentrennung, Vertragsdaten, Zutritt, Auslastung, Kennzahlen, alle Schreibwege mit
+Vorschau und Ausführung, Protokoll, Kommandozeile,
 dazu ein Test, der `openapi.yaml` und den MCP-Server gegen die echten Routen hält.

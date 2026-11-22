@@ -16,8 +16,8 @@ class GymApiClient extends Model
     public const TOKEN_PREFIX = 'gpa_';
 
     /**
-     * Every ability the Agent API knows, one per area, so a token only sees
-     * what its job needs.
+     * Every ability the Agent API knows. Reading and writing are separate on
+     * purpose: an agent that only answers questions never needs a write ability.
      */
     public const ABILITIES = [
         'plans.read',
@@ -26,6 +26,8 @@ class GymApiClient extends Model
         'access.read',
         'payments.read',
         'stats.read',
+        'members.write',
+        'contracts.write',
     ];
 
     public const READ_ABILITIES = [

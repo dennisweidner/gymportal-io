@@ -2,6 +2,7 @@
 
 namespace Tests\Feature\Api\Agent;
 
+use App\Events\ContractCancelled;
 use App\Models\AgentApiLog;
 use App\Models\CheckIn;
 use App\Models\Gym;
@@ -10,7 +11,9 @@ use App\Models\Member;
 use App\Models\MemberAccessConfig;
 use App\Models\Membership;
 use App\Models\MembershipPlan;
+use Carbon\Carbon;
 use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Mail;
 use Illuminate\Support\Facades\Route;
 use Illuminate\Support\Str;
@@ -20,8 +23,8 @@ use Tests\TestCase;
 
 /**
  * The Agent API lets an automation act for one gym. These tests pin down the
- * two promises it makes: the tenant comes from the token, and a token can only
- * do what its abilities say.
+ * three promises it makes: the tenant comes from the token, a token can only do
+ * what its abilities say, and a write changes nothing until it is confirmed.
  */
 class AgentApiTest extends TestCase
 {
@@ -46,6 +49,7 @@ class AgentApiTest extends TestCase
         parent::setUp();
 
         Mail::fake();
+        Event::fake([ContractCancelled::class]);
 
         $this->gym = Gym::factory()->create();
         $this->otherGym = Gym::factory()->create();
@@ -135,16 +139,19 @@ class AgentApiTest extends TestCase
     }
 
     #[Test]
-    public function a_token_without_the_ability_gets_403(): void
+    public function a_token_without_the_ability_gets_403_and_changes_nothing(): void
     {
-        $plansOnly = $this->issue(['plans.read']);
+        $readOnly = $this->issue(GymApiClient::READ_ABILITIES);
 
-        $this->agent($plansOnly)
-            ->getJson($this->url('members'))
+        $this->agent($readOnly)
+            ->postJson($this->url("members/{$this->member->id}/contract/cancellation"), ['confirm' => true])
             ->assertStatus(403)
-            ->assertJsonPath('error.required_ability', 'members.read');
+            ->assertJsonPath('error.required_ability', 'contracts.write');
 
-        $this->agent($plansOnly)->getJson($this->url("members/{$this->member->id}/payments"))->assertStatus(403);
+        $this->assertNull($this->membership->fresh()->cancellation_date);
+
+        $plansOnly = $this->issue(['plans.read']);
+        $this->agent($plansOnly)->getJson($this->url('members'))->assertStatus(403);
         $this->agent($plansOnly)->getJson($this->url('plans'))->assertOk();
     }
 
@@ -180,6 +187,8 @@ class AgentApiTest extends TestCase
         $this->agent()->getJson($this->url("members/{$id}/contract"))->assertStatus(404);
         $this->agent()->getJson($this->url("members/{$id}/access"))->assertStatus(404);
         $this->agent()->getJson($this->url("members/{$id}/payments"))->assertStatus(404);
+        $this->agent()->patchJson($this->url("members/{$id}"), ['phone' => '1', 'confirm' => true])->assertStatus(404);
+        $this->agent()->postJson($this->url("members/{$id}/contract/cancellation"), ['confirm' => true])->assertStatus(404);
 
         $this->agent()->getJson($this->url('members/lookup?email=fremd@example.org'))
             ->assertOk()->assertJsonPath('data.match', 'none');
@@ -372,25 +381,218 @@ class AgentApiTest extends TestCase
         $this->assertSame($paid->id, $data['contract_membership']['id']);
     }
 
-    // --- audit ----------------------------------------------------------
+    // --- writing --------------------------------------------------------
 
     #[Test]
-    public function every_request_is_logged_and_reads_change_nothing(): void
+    public function a_cancellation_is_only_a_preview_until_confirmed(): void
     {
-        $response = $this->agent()->getJson($this->url("members/{$this->member->id}/contract"))->assertOk();
-        $this->agent()->getJson($this->url('plans'))->assertOk();
-        $this->agent($this->issue(['plans.read']))->getJson($this->url('members'))->assertStatus(403);
+        $expected = $this->membership->fresh()->nextPossibleCancellationDate();
+
+        $this->agent()->postJson($this->url("members/{$this->member->id}/contract/cancellation"), ['reason' => 'move'])
+            ->assertOk()
+            ->assertJsonPath('data.preview', true)
+            ->assertJsonPath('data.cancellation.effective_date', $expected);
+
+        $this->assertNull($this->membership->fresh()->cancellation_date);
+        Event::assertNotDispatched(ContractCancelled::class);
+
+        $this->agent()->postJson($this->url("members/{$this->member->id}/contract/cancellation"), ['reason' => 'move', 'confirm' => true, 'expected_effective_date' => $expected])
+            ->assertOk()
+            ->assertJsonPath('data.preview', false)
+            ->assertJsonPath('data.membership.cancellation.is_cancelled', true)
+            ->assertJsonPath('data.membership.cancellation.effective_date', $expected);
+
+        $fresh = $this->membership->fresh();
+        $this->assertSame($expected, substr((string) $fresh->getRawOriginal('cancellation_date'), 0, 10));
+        $this->assertNotNull($fresh->cancellation_received_at);
+        $this->assertStringContainsString('Umzug', $fresh->cancellation_reason);
+        Event::assertDispatched(ContractCancelled::class, 1);
+
+        // A second cancellation must not move the date or the receipt.
+        $this->agent()->postJson($this->url("members/{$this->member->id}/contract/cancellation"), ['confirm' => true])
+            ->assertStatus(409)->assertJsonPath('error.code', 'already_cancelled');
+    }
+
+    #[Test]
+    public function a_cancellation_can_be_revoked(): void
+    {
+        $expected = $this->membership->fresh()->nextPossibleCancellationDate();
+        $this->agent()->postJson($this->url("members/{$this->member->id}/contract/cancellation"), ['confirm' => true, 'expected_effective_date' => $expected])->assertOk();
+
+        $this->agent()->deleteJson($this->url("members/{$this->member->id}/contract/cancellation"))
+            ->assertOk()->assertJsonPath('data.preview', true);
+        $this->assertNotNull($this->membership->fresh()->cancellation_date);
+
+        $this->agent()->deleteJson($this->url("members/{$this->member->id}/contract/cancellation"), ['confirm' => true])
+            ->assertOk()->assertJsonPath('data.membership.cancellation.is_cancelled', false);
+        $this->assertNull($this->membership->fresh()->cancellation_date);
+
+        $this->agent()->deleteJson($this->url("members/{$this->member->id}/contract/cancellation"), ['confirm' => true])
+            ->assertStatus(422);
+    }
+
+    #[Test]
+    public function pause_and_resume_follow_the_portal_rules(): void
+    {
+        $body = ['start_date' => today()->toDateString(), 'end_date' => today()->addWeeks(4)->toDateString()];
+
+        $this->agent()->postJson($this->url("members/{$this->member->id}/contract/pause"), $body)
+            ->assertOk()->assertJsonPath('data.preview', true);
+        $this->assertSame('active', $this->membership->fresh()->status);
+
+        $this->agent()->postJson($this->url("members/{$this->member->id}/contract/pause"), $body + ['confirm' => true])
+            ->assertOk()->assertJsonPath('data.membership.pause.is_paused', true);
+        $this->assertSame('paused', $this->membership->fresh()->status);
+
+        $this->agent()->postJson($this->url("members/{$this->member->id}/contract/pause"), ['start_date' => '2020-01-01', 'end_date' => '2020-02-01'])
+            ->assertStatus(422);
+
+        $this->agent()->postJson($this->url("members/{$this->member->id}/contract/resume"), ['confirm' => true])
+            ->assertOk()->assertJsonPath('data.membership.status', 'active');
+        $this->assertSame('active', $this->membership->fresh()->status);
+    }
+
+    #[Test]
+    public function contact_data_changes_are_previewed_then_stored(): void
+    {
+        $url = $this->url("members/{$this->member->id}");
+
+        $this->agent()->patchJson($url, ['city' => 'Potsdam', 'postal_code' => '14467'])
+            ->assertOk()->assertJsonPath('data.preview', true)->assertJsonPath('data.changes.city.to', 'Potsdam');
+        $this->assertNotSame('Potsdam', $this->member->fresh()->city);
+
+        $this->agent()->patchJson($url, ['city' => 'Potsdam', 'postal_code' => '14467', 'confirm' => true])
+            ->assertOk()->assertJsonPath('data.member.city', 'Potsdam');
+        $this->assertSame('Potsdam', $this->member->fresh()->city);
+
+        // Fields outside the list are ignored, never written.
+        $this->agent()->patchJson($url, ['status' => 'inactive', 'member_number' => 'X', 'confirm' => true])->assertStatus(422);
+        $this->assertSame('active', $this->member->fresh()->status);
+        $this->assertSame('M-1001', $this->member->fresh()->member_number);
+    }
+
+    #[Test]
+    public function an_email_change_is_refused(): void
+    {
+        foreach ([[], ['confirm' => true]] as $extra) {
+            $this->agent()->patchJson($this->url("members/{$this->member->id}"), ['email' => 'neu@example.org'] + $extra)
+                ->assertStatus(422)
+                ->assertJsonPath('error.code', 'email_change_not_supported');
+        }
+
+        $this->assertSame('mia@example.org', $this->member->fresh()->email);
+    }
+
+    #[Test]
+    public function a_confirm_in_the_query_string_changes_nothing(): void
+    {
+        $this->agent()->patchJson($this->url("members/{$this->member->id}?confirm=1"), ['city' => 'Potsdam'])
+            ->assertOk()
+            ->assertJsonPath('data.preview', true);
+
+        $this->assertNotSame('Potsdam', $this->member->fresh()->city);
+    }
+
+    #[Test]
+    public function a_confirmation_must_name_the_date_of_the_preview(): void
+    {
+        $url = $this->url("members/{$this->member->id}/contract/cancellation");
+        $expected = $this->membership->fresh()->nextPossibleCancellationDate();
+
+        $this->agent()->postJson($url, ['confirm' => true])
+            ->assertStatus(422)
+            ->assertJsonPath('error.code', 'expected_effective_date_required');
+
+        $this->agent()->postJson($url, ['confirm' => true, 'expected_effective_date' => Carbon::parse($expected)->subMonth()->toDateString()])
+            ->assertStatus(409)
+            ->assertJsonPath('error.code', 'effective_date_changed')
+            ->assertJsonPath('error.cancellation.effective_date', $expected);
+
+        $this->assertNull($this->membership->fresh()->cancellation_date);
+        Event::assertNotDispatched(ContractCancelled::class);
+    }
+
+    #[Test]
+    public function a_pause_during_a_free_period_is_refused(): void
+    {
+        $freePlan = MembershipPlan::factory()->create(['gym_id' => $this->gym->id, 'is_free_trial_plan' => true]);
+        $member = Member::factory()->create(['gym_id' => $this->gym->id, 'status' => 'active']);
+        $free = Membership::factory()->create([
+            'member_id' => $member->id,
+            'membership_plan_id' => $freePlan->id,
+            'start_date' => now()->subDays(5)->toDateString(),
+            'end_date' => now()->addDays(10)->toDateString(),
+            'status' => 'active',
+        ]);
+        Membership::factory()->create([
+            'member_id' => $member->id,
+            'membership_plan_id' => $this->plan->id,
+            'start_date' => now()->addDays(11)->toDateString(),
+            'status' => 'active',
+            'linked_free_membership_id' => $free->id,
+        ]);
+
+        $this->agent()->postJson($this->url("members/{$member->id}/contract/pause"), [
+            'start_date' => today()->toDateString(),
+            'end_date' => today()->addWeeks(8)->toDateString(),
+            'confirm' => true,
+        ])->assertStatus(422)->assertJsonPath('error.code', 'free_period_running');
+
+        $this->assertSame('active', $free->fresh()->status);
+        $this->assertSame(now()->addDays(10)->toDateString(), substr((string) $free->fresh()->getRawOriginal('end_date'), 0, 10));
+    }
+
+    #[Test]
+    public function a_note_is_previewed_then_appended(): void
+    {
+        $this->member->update(['notes' => 'Alt']);
+        $url = $this->url("members/{$this->member->id}/notes");
+
+        $this->agent()->postJson($url, ['text' => 'Ruft wegen Umzug an'])->assertOk()->assertJsonPath('data.preview', true);
+        $this->assertSame('Alt', $this->member->fresh()->notes);
+
+        $this->agent()->postJson($url, ['text' => 'Ruft wegen Umzug an', 'confirm' => true])->assertOk();
+        $notes = $this->member->fresh()->notes;
+        $this->assertStringStartsWith("Alt\n", $notes);
+        $this->assertStringContainsString('(Testagent): Ruft wegen Umzug an', $notes);
+
+        $this->agent($this->issue(GymApiClient::READ_ABILITIES))->postJson($url, ['text' => 'x', 'confirm' => true])->assertStatus(403);
+    }
+
+    #[Test]
+    public function an_executed_write_keeps_the_old_and_the_new_value(): void
+    {
+        $old = $this->member->city;
+
+        $this->agent()->patchJson($this->url("members/{$this->member->id}"), ['city' => 'Potsdam'])->assertOk();
+        $response = $this->agent()->patchJson($this->url("members/{$this->member->id}"), ['city' => 'Potsdam', 'confirm' => true])->assertOk();
 
         $this->assertSame('noindex, nofollow', $response->headers->get('X-Robots-Tag'));
 
+        [$preview, $write] = AgentApiLog::orderBy('id')->get()->all();
+
+        $this->assertNull($preview->changes);
+        $this->assertSame(['city' => ['from' => $old, 'to' => 'Potsdam']], $write->changes);
+    }
+
+    // --- audit ----------------------------------------------------------
+
+    #[Test]
+    public function every_request_is_logged_and_only_real_writes_count_as_changes(): void
+    {
+        $this->agent()->getJson($this->url("members/{$this->member->id}/contract"))->assertOk();
+        $expected = $this->membership->fresh()->nextPossibleCancellationDate();
+        $this->agent()->postJson($this->url("members/{$this->member->id}/contract/cancellation"), [])->assertOk();
+        $this->agent()->postJson($this->url("members/{$this->member->id}/contract/cancellation"), ['confirm' => true, 'expected_effective_date' => $expected])->assertOk();
+        $this->agent($this->issue(['plans.read']))->getJson($this->url('members'))->assertStatus(403);
+
         $logs = AgentApiLog::orderBy('id')->get();
 
-        $this->assertCount(3, $logs);
-        $this->assertSame([false, false, false], $logs->pluck('changed_data')->all());
-        $this->assertSame([200, 200, 403], $logs->pluck('status')->all());
-        $this->assertSame($this->member->id, $logs[0]->member_id);
-        $this->assertSame('contracts.read', $logs[0]->ability);
-        $this->assertNull($logs[0]->changes);
+        $this->assertCount(4, $logs);
+        $this->assertSame([false, false, true, false], $logs->pluck('changed_data')->all());
+        $this->assertSame([200, 200, 200, 403], $logs->pluck('status')->all());
+        $this->assertSame($this->member->id, $logs[2]->member_id);
+        $this->assertSame('contracts.write', $logs[2]->ability);
         $this->assertTrue($logs->every(fn ($log) => $log->gym_id === $this->gym->id));
     }
 
