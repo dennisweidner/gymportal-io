@@ -330,6 +330,7 @@ class WidgetController extends Controller
             'iban' => 'required_if:payment_method,sepa_direct_debit|required_if:payment_method,mollie_directdebit|nullable|string|min:15|max:34',
             'account_holder' => 'required_if:payment_method,sepa_direct_debit|required_if:payment_method,mollie_directdebit|nullable|string',
             'sepa_mandate_acknowledged' => 'sometimes|boolean',
+            'legal_texts_acknowledged' => 'sometimes|accepted',
             'selected_addons' => 'sometimes|array',
             'selected_addons.*' => 'integer|exists:addons,id',
         ]);
@@ -397,6 +398,7 @@ class WidgetController extends Controller
                 'payment_method' => $request->payment_method,
                 'selected_addons' => $request->input('selected_addons', []),
                 'widget_session' => $sessionId,
+                'legal_texts_acknowledged' => $request->boolean('legal_texts_acknowledged'),
             ];
 
             // SEPA-spezifische Daten hinzufügen
